@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+# 【注释 01】模块级依赖从通用工具开始：日志、时间、UUID 先提供横切能力，后面的业务流程都会复用。
 import logging
 from datetime import datetime
 from time import time
@@ -23,11 +24,14 @@ from dotenv import load_dotenv
 from pydantic import BaseModel
 from typing_extensions import LiteralString
 
+# 【注释 02】随后导入 Graphiti 的核心抽象：driver 负责图数据库，LLM/Embedder/Reranker 负责语义处理。
+# 这些依赖在 GraphitiClients 中被打包，方便后续节点、边、搜索等流程统一传递。
 from graphiti_core.cross_encoder.client import CrossEncoderClient
 from graphiti_core.cross_encoder.openai_reranker_client import OpenAIRerankerClient
 from graphiti_core.decorators import handle_multiple_group_ids
 from graphiti_core.driver.driver import GraphDriver
 from graphiti_core.driver.neo4j_driver import Neo4jDriver
+# 【注释 03】边类型按图谱层次组织：实体边描述事实，episode 边描述来源，community/saga 边描述更高层结构。
 from graphiti_core.edges import (
     CommunityEdge,
     Edge,
@@ -48,6 +52,7 @@ from graphiti_core.helpers import (
 )
 from graphiti_core.llm_client import LLMClient, OpenAIClient
 from graphiti_core.namespaces import EdgeNamespace, NodeNamespace
+# 【注释 04】节点类型与边类型对应：EpisodicNode 是输入来源，EntityNode 是抽取后的知识实体，Saga/Community 是聚合视角。
 from graphiti_core.nodes import (
     CommunityNode,
     EntityNode,
@@ -73,6 +78,7 @@ from graphiti_core.search.search_utils import (
 )
 from graphiti_core.telemetry import capture_event
 from graphiti_core.tracer import Tracer, create_tracer
+# 【注释 05】bulk_utils 中的函数支撑批量写入、去重、指针修正；这是批处理路径能复用单条 episode 逻辑的关键。
 from graphiti_core.utils.bulk_utils import (
     RawEpisode,
     add_nodes_and_edges_bulk,
@@ -88,6 +94,7 @@ from graphiti_core.utils.maintenance.community_operations import (
     remove_communities,
     update_community,
 )
+# 【注释 06】maintenance 模块提供“抽取—解析—构边”的底层操作，Graphiti 类主要负责编排这些步骤。
 from graphiti_core.utils.maintenance.edge_operations import (
     build_episodic_edges,
     extract_edges,
@@ -106,11 +113,13 @@ from graphiti_core.utils.maintenance.node_operations import (
 from graphiti_core.utils.ontology_utils.entity_types_utils import validate_entity_types
 from graphiti_core.utils.text_utils import MAX_SUMMARY_CHARS
 
+# 【注释 07】模块初始化只做轻量准备：创建日志器，并加载环境变量，避免把环境读取散落在各个方法里。
 logger = logging.getLogger(__name__)
 
 load_dotenv()
 
 
+# 【注释 08】下面三个 BaseModel 是对外返回值的结构化封装：把一次写图操作产生的节点、边、社区结果统一打包。
 class AddEpisodeResults(BaseModel):
     episode: EpisodicNode
     episodic_edges: list[EpisodicEdge]
@@ -120,6 +129,7 @@ class AddEpisodeResults(BaseModel):
     community_edges: list[CommunityEdge]
 
 
+# 【注释 09】批量添加 episode 的返回结构与单条类似，但 episode 字段变成列表，便于调用方一次性拿到所有新增对象。
 class AddBulkEpisodeResults(BaseModel):
     episodes: list[EpisodicNode]
     episodic_edges: list[EpisodicEdge]
@@ -129,12 +139,15 @@ class AddBulkEpisodeResults(BaseModel):
     community_edges: list[CommunityEdge]
 
 
+# 【注释 10】Triplet 写入只涉及一条 source-edge-target 事实，因此返回模型只保留实体节点和实体边。
 class AddTripletResults(BaseModel):
     nodes: list[EntityNode]
     edges: list[EntityEdge]
 
 
+# 【注释 11】Graphiti 是门面类：它不直接实现所有算法，而是把数据库、LLM、嵌入、重排、搜索和维护操作串成业务流程。
 class Graphiti:
+    # 【注释 12】初始化阶段的逻辑顺序是：先确定图数据库连接，再确定 AI 客户端，最后把它们封装成命名空间和 clients。
     def __init__(
         self,
         uri: str | None = None,
@@ -204,6 +217,7 @@ class Graphiti:
         Graphiti if you're using the default OpenAIClient.
         """
 
+        # 【注释 13】允许外部传入 driver 是为了支持测试或替换后端；否则才根据 URI 创建默认 Neo4jDriver。
         if graph_driver:
             self.driver = graph_driver
         else:
@@ -211,8 +225,10 @@ class Graphiti:
                 raise ValueError('uri must be provided when graph_driver is None')
             self.driver = Neo4jDriver(uri, user, password)
 
+        # 【注释 14】这些实例配置会影响后续写入行为：是否保存原文、并发上限、以及使用哪些默认客户端。
         self.store_raw_episode_content = store_raw_episode_content
         self.max_coroutines = max_coroutines
+        # 【注释 15】LLM、Embedder、CrossEncoder 都采用“外部注入优先，默认 OpenAI 实现兜底”的策略，保持扩展性。
         if llm_client:
             self.llm_client = llm_client
         else:
@@ -226,12 +242,14 @@ class Graphiti:
         else:
             self.cross_encoder = OpenAIRerankerClient()
 
+        # 【注释 16】tracer 是横切能力：后续 add_episode / bulk 等长流程会用 span 记录耗时和异常。
         # Initialize tracer
         self.tracer = create_tracer(tracer, trace_span_prefix)
 
         # Set tracer on clients
         self.llm_client.set_tracer(self.tracer)
 
+        # 【注释 17】GraphitiClients 把多个底层客户端聚合起来，避免每个工具函数都要传一长串依赖。
         self.clients = GraphitiClients(
             driver=self.driver,
             llm_client=self.llm_client,
@@ -241,14 +259,18 @@ class Graphiti:
         )
 
         # Initialize namespace API (graphiti.nodes.entity.save(), etc.)
+        # 【注释 18】namespace API 是更细粒度的节点/边操作入口，和高层 add_episode/search 流程并行存在。
         self.nodes = NodeNamespace(self.driver, self.embedder)
         self.edges = EdgeNamespace(self.driver, self.embedder)
 
+        # 【注释 19】最后上报初始化遥测；它不参与业务正确性，所以放在资源都准备好之后执行。
         # Capture telemetry event
         self._capture_initialization_telemetry()
 
+    # 【注释 20】初始化遥测只记录“使用了哪些 provider”，帮助统计运行环境，而不改变图谱数据。
     def _capture_initialization_telemetry(self):
         """Capture telemetry event for Graphiti initialization."""
+        # 【注释 21】遥测被包在 try 中，说明它是非关键路径：失败时不能影响 Graphiti 实例创建。
         try:
             # Detect provider types from class names
             llm_provider = self._get_provider_type(self.llm_client)
@@ -263,11 +285,14 @@ class Graphiti:
                 'database_provider': database_provider,
             }
 
+            # 【注释 22】真正发送事件前，先把 LLM、嵌入、重排、数据库 provider 统一转换成简单字符串。
             capture_event('graphiti_initialized', properties)
+        # 【注释 23】这里吞掉异常是有意设计：遥测故障不应该让用户的图数据库连接或 AI 客户端初始化失败。
         except Exception:
             # Silently handle telemetry errors
             pass
 
+    # 【注释 24】token_tracker 暴露的是 LLM 客户端内部统计，方便外部观察 prompt/token 成本，而不接触 LLM 实现细节。
     @property
     def token_tracker(self):
         """Access the LLM client's token usage tracker.
@@ -280,13 +305,17 @@ class Graphiti:
         """
         return self.llm_client.token_tracker
 
+    # 【注释 25】provider 识别采用类名约定，而不是 isinstance；这样新 provider 只要命名规范就能被粗略归类。
     def _get_provider_type(self, client) -> str:
         """Get provider type from client class name."""
+        # 【注释 26】None 先处理掉，避免后面对空对象取 class 名。
         if client is None:
             return 'none'
 
+        # 【注释 27】统一转小写后做包含判断，降低不同实现类命名大小写不一致带来的分支复杂度。
         class_name = client.__class__.__name__.lower()
 
+        # 【注释 28】这里按 provider 类型分组判断：先识别 AI 客户端，再识别数据库和嵌入模型。
         # LLM providers
         if 'openai' in class_name:
             return 'openai'
@@ -311,6 +340,7 @@ class Graphiti:
         else:
             return 'unknown'
 
+    # 【注释 29】close 是生命周期收尾：Graphiti 自身不持久化额外状态，关闭 driver 就能释放主要外部资源。
     async def close(self):
         """
         Close the connection to the Neo4j database.
@@ -341,8 +371,10 @@ class Graphiti:
             finally:
                 graphiti.close()
         """
+        # 【注释 30】异步关闭数据库连接，保证未完成的底层连接清理交给 driver 处理。
         await self.driver.close()
 
+    # 【注释 31】Saga 是跨 episode 的故事线/会话线；这里采用 get-or-create，避免同名同 group 的 saga 重复创建。
     async def _get_or_create_saga(
         self, saga_name: str, group_id: str, created_at: datetime
     ) -> SagaNode:
@@ -366,8 +398,10 @@ class Graphiti:
         SagaNode
             The existing or newly created saga node.
         """
+        # 【注释 32】parse_db_date 局部导入，说明只有数据库返回日期时才需要它，也能减少模块加载时的循环依赖风险。
         from graphiti_core.helpers import parse_db_date
 
+        # 【注释 33】先按 name + group_id 查询，确保 saga 的唯一性限定在同一个图分区内。
         records, _, _ = await self.driver.execute_query(
             """
             MATCH (s:Saga {name: $name, group_id: $group_id})
@@ -378,6 +412,7 @@ class Graphiti:
             routing_='r',
         )
 
+        # 【注释 34】查到已有 saga 时直接把数据库记录还原成 SagaNode；这样后续边可以复用同一个 uuid。
         if records:
             record = records[0]
             return SagaNode(
@@ -387,14 +422,18 @@ class Graphiti:
                 created_at=parse_db_date(record['created_at']),  # type: ignore
             )
 
+        # 【注释 35】没有命中才创建新 SagaNode，并用调用方传入的 created_at 保留事件时间语义。
         saga = SagaNode(name=saga_name, group_id=group_id, created_at=created_at)
+        # 【注释 36】所有字段在内存中更新完成后再保存，保证 summary 和水位线同步落库。
         await saga.save(self.driver)
         return saga
 
+    # 【注释 37】查找 saga 中前一个 episode，用来建立 NEXT_EPISODE 链，保持 saga 内 episode 的时间顺序。
     async def _saga_get_previous_episode_uuid(
         self, saga_uuid: str, current_episode_uuid: str
     ) -> str | None:
         """Find the most recent episode UUID in a saga, excluding the current one."""
+        # 【注释 38】优先走 driver 的 IoC 接口：不同数据库后端可以提供更优实现；不支持时再回退到通用 Cypher。
         if self.driver.graph_operations_interface:
             try:
                 return await self.driver.graph_operations_interface.saga_get_previous_episode_uuid(
@@ -403,6 +442,7 @@ class Graphiti:
             except NotImplementedError:
                 pass
 
+        # 【注释 39】通用查询按 valid_at、created_at 倒序取最近一条，并排除当前 episode，避免自连。
         records, _, _ = await self.driver.execute_query(
             """
             MATCH (s:Saga {uuid: $saga_uuid})-[:HAS_EPISODE]->(e:Episodic)
@@ -415,10 +455,12 @@ class Graphiti:
             current_episode_uuid=current_episode_uuid,
             routing_='r',
         )
+        # 【注释 40】找到前序 episode 就返回 uuid；找不到代表当前 episode 是 saga 的第一条或数据为空。
         if records:
             return records[0]['uuid']
         return None
 
+    # 【注释 41】该方法只尝试通过后端接口取 episode 内容；若后端不支持，返回 None 让 summarize_saga 自己执行回退查询。
     async def _saga_get_episode_contents(
         self,
         saga_uuid: str,
@@ -433,8 +475,10 @@ class Graphiti:
                 )
             except NotImplementedError:
                 pass
+        # 【注释 42】返回 None 与返回空列表含义不同：None 表示“接口不可用”，空列表表示“接口可用但没有新内容”。
         return None
 
+    # 【注释 43】summarize_saga 的核心是增量总结：用上次总结的水位线只拉取新增 episode，再更新 saga 摘要。
     async def summarize_saga(self, saga_id: str) -> SagaNode:
         """Incrementally summarize a saga using only new episodes since the last summary.
 
@@ -474,17 +518,22 @@ class Graphiti:
         NodeNotFoundError
             If the saga with the given UUID does not exist.
         """
+        # 【注释 44】先取 saga 本体，因为后续需要已有 summary、水位线以及最终保存的目标节点。
         saga = await SagaNode.get_by_uuid(self.driver, saga_id)
 
         # Fetch only episodes added since the last summary (or all if never summarized).
+        # 【注释 45】限制每次总结的 episode 数量，避免一次 prompt 过大；since 记录增量起点。
         max_episodes = 200
         since = saga.last_summarized_at
 
         # Try IoC interface first, fall back to raw Cypher
+        # 【注释 46】先尝试后端定制接口，让数据库实现有机会优化内容读取。
         episodes_data = await self._saga_get_episode_contents(
             saga_id, since=since, limit=max_episodes
         )
+        # 【注释 47】只有接口不可用时才进入 Cypher 回退；如果接口返回空列表，就应该按“无新增内容”处理。
         if episodes_data is None:
+            # 【注释 48】有 last_summarized_at 时走增量查询，只读取上次总结后新写入的 episode。
             if since is not None:
                 records, _, _ = await self.driver.execute_query(
                     """
@@ -511,9 +560,11 @@ class Graphiti:
                     limit=max_episodes,
                     routing_='r',
                 )
+                # 【注释 49】没有水位线代表首次总结：先取最近 N 条，再反转成时间正序供 LLM 阅读。
                 # Reverse to chronological order for the prompt
                 records = list(reversed(records))
 
+            # 【注释 50】数据库日期在进入 LLM/水位线逻辑前统一解析，避免后面混用字符串和 datetime。
             from graphiti_core.helpers import parse_db_date
 
             episodes_data = [
@@ -522,6 +573,7 @@ class Graphiti:
                 if r.get('content')
             ]
 
+        # 【注释 51】没有新增 episode 时直接返回原 saga，避免生成空摘要覆盖已有 summary。
         if not episodes_data:
             logger.info(f'No new episodes found for saga {saga_id}, skipping summary')
             return saga
@@ -529,12 +581,14 @@ class Graphiti:
         episode_contents = [content for content, _ in episodes_data]
         valid_ats = [valid_at for _, valid_at in episodes_data if valid_at is not None]
 
+        # 【注释 52】传给 LLM 的上下文包含 saga 名、旧摘要和新增 episode，目的是在保留历史的基础上吸收新信息。
         context = {
             'saga_name': saga.name,
             'existing_summary': saga.summary or '',
             'episodes': episode_contents,
         }
 
+        # 【注释 53】通过结构化 response_model 约束 LLM 输出，减少后续解析 summary 字段的不确定性。
         llm_response = await self.llm_client.generate_response(
             prompt_library.summarize_sagas.summarize_saga(context),
             response_model=SagaSummary,
@@ -542,9 +596,11 @@ class Graphiti:
         )
 
         summary = llm_response.get('summary', '')
+        # 【注释 54】摘要截断是存储层保护：即使 LLM 输出过长，也不会让节点字段无限增长。
         if len(summary) > MAX_SUMMARY_CHARS:
             summary = summary[:MAX_SUMMARY_CHARS]
 
+        # 【注释 55】先更新 summary，再分别更新两个水位线：一个服务增量过滤，一个服务事件时间语义。
         saga.summary = summary
         # Wall-clock watermark for the next-run filter: keeps backfilled
         # episodes (valid_at in the past, created_at = now) reachable on
@@ -567,6 +623,7 @@ class Graphiti:
 
         return saga
 
+    # 【注释 56】索引和约束属于图数据库结构准备，通常在正式写入 episode 前执行一次。
     async def build_indices_and_constraints(self, delete_existing: bool = False):
         """
         Build indices and constraints in the Neo4j database.
@@ -599,8 +656,10 @@ class Graphiti:
         Caution: Running this method on a large existing database may take some time
         and could impact database performance during execution.
         """
+        # 【注释 57】具体建哪些索引由 driver 决定，Graphiti 只暴露统一入口。
         await self.driver.build_indices_and_constraints(delete_existing)
 
+    # 【注释 58】节点处理被拆成“抽取”和“解析”两步：先从文本中找候选实体，再和已有图谱去重/合并。
     async def _extract_and_resolve_nodes(
         self,
         episode: EpisodicNode | list[EpisodicNode],
@@ -611,13 +670,17 @@ class Graphiti:
         list[EntityNode], dict[str, str], list[tuple[EntityNode, EntityNode]], dict[str, list[int]]
     ]:
         """Extract nodes from episode(s) and resolve against existing graph."""
+        # 【注释 59】把单条和多条 episode 统一成列表，后续代码只需要处理一种形态。
         episodes = episode if isinstance(episode, list) else [episode]
+        # 【注释 60】解析阶段需要一个主 episode 作为上下文锚点；批量传入时默认使用第一条。
         primary_episode = episodes[0]
 
+        # 【注释 61】extract_nodes 只负责产生候选节点，并记录节点来自哪些 episode，用于后面建立 MENTIONS 类边。
         extracted_nodes, node_episode_index_map = await extract_nodes(
             self.clients, episode, previous_episodes, entity_types, excluded_entity_types
         )
 
+        # 【注释 62】resolve_extracted_nodes 会把候选节点映射到已有或新建 uuid，uuid_map 是后续修正边端点的关键。
         nodes, uuid_map, duplicates = await resolve_extracted_nodes(
             self.clients,
             extracted_nodes,
@@ -628,6 +691,7 @@ class Graphiti:
 
         return nodes, uuid_map, duplicates, node_episode_index_map
 
+    # 【注释 63】边处理依赖节点结果：边的端点必须先通过节点解析得到稳定 uuid，才能进入事实去重和失效判断。
     async def _extract_and_resolve_edges(
         self,
         episode: EpisodicNode | list[EpisodicNode],
@@ -650,9 +714,11 @@ class Graphiti:
             - invalidated_edges: Edges invalidated by new information
             - new_edges: Only edges that are new to the graph (not duplicates)
         """
+        # 【注释 64】同样把 episode 统一为列表；primary_episode 用于给边解析提供代表性上下文。
         episodes = episode if isinstance(episode, list) else [episode]
         primary_episode = episodes[0]
 
+        # 【注释 65】先基于 episode 文本、已抽取节点和 edge_type_map 抽取候选事实边。
         extracted_edges = await extract_edges(
             self.clients,
             episode,
@@ -664,8 +730,10 @@ class Graphiti:
             custom_extraction_instructions,
         )
 
+        # 【注释 66】候选边可能仍指向抽取阶段的临时节点 uuid，这里用 uuid_map 改写成解析后的真实端点。
         edges = resolve_edge_pointers(extracted_edges, uuid_map)
 
+        # 【注释 67】边解析同时产出三类结果：可保存的边、被新事实否定的旧边、以及真正新增的边。
         resolved_edges, invalidated_edges, new_edges = await resolve_extracted_edges(
             self.clients,
             edges,
@@ -677,6 +745,7 @@ class Graphiti:
 
         return resolved_edges, invalidated_edges, new_edges
 
+    # 【注释 68】该方法负责最终落库：把 episode、MENTIONS 边、实体节点、事实边，以及可选 saga 关系一次性保存。
     async def _process_episode_data(
         self,
         episode: EpisodicNode | list[EpisodicNode],
@@ -714,15 +783,20 @@ class Graphiti:
             Optional mapping from node UUID to 0-indexed episode positions for
             building episodic edges with correct attribution.
         """
+        # 【注释 69】保存阶段也统一单条/多条输入，方便 bulk 与单条流程复用同一套写入逻辑。
         episodes = episode if isinstance(episode, list) else [episode]
+        # 【注释 70】先收集 episode uuid，后面构建 episodic_edges 时需要知道每个实体来自哪些 episode。
         episode_uuids = [ep.uuid for ep in episodes]
 
+        # 【注释 71】构建 episode 到实体的关联边，让图谱能追溯某个实体/事实来自哪些原始输入。
         episodic_edges = build_episodic_edges(nodes, episode_uuids, now, node_episode_index_map)
+        # 【注释 72】每个 episode 记录它关联的实体边 uuid；如果配置不保存原文，则在落库前清空 content。
         for ep in episodes:
             ep.entity_edges = [edge.uuid for edge in entity_edges]
             if not self.store_raw_episode_content:
                 ep.content = ''
 
+        # 【注释 73】第一次统一写入 episode、episodic_edges、实体节点和实体边，减少多次数据库往返。
         await add_nodes_and_edges_bulk(
             self.driver,
             episodes,
@@ -732,8 +806,10 @@ class Graphiti:
             self.embedder,
         )
 
+        # 【注释 74】后续 saga 关系只绑定主 episode；单条流程中它就是当前 episode。
         primary_episode = episodes[0]
 
+        # 【注释 75】saga 关系是可选增强：不影响基础知识图谱写入，只在调用方传入 saga 时建立故事线。
         # Handle saga association if provided
         if saga is not None:
             # Get or create saga node based on input type
@@ -746,6 +822,7 @@ class Graphiti:
             else:
                 saga_node = saga
 
+            # 【注释 76】如果调用方已经知道前序 episode，就直接使用；否则查询数据库，兼顾批量追加的效率和单次调用的易用性。
             # Use provided previous episode UUID or query for it
             previous_episode_uuid: str | None = saga_previous_episode_uuid
             if previous_episode_uuid is None:
@@ -753,6 +830,7 @@ class Graphiti:
                     saga_node.uuid, primary_episode.uuid
                 )
 
+            # 【注释 77】NEXT_EPISODE 表示 saga 内的时间链；只有存在前序 episode 时才需要创建。
             # Create NEXT_EPISODE edge from the previous episode to the new one
             if previous_episode_uuid is not None:
                 next_episode_edge = NextEpisodeEdge(
@@ -763,6 +841,7 @@ class Graphiti:
                 )
                 await next_episode_edge.save(self.driver)
 
+            # 【注释 78】HAS_EPISODE 表示 saga 包含该 episode，它和 NEXT_EPISODE 分别表达归属关系和顺序关系。
             # Create HAS_EPISODE edge from saga to the new episode
             has_episode_edge = HasEpisodeEdge(
                 source_node_uuid=saga_node.uuid,
@@ -772,6 +851,7 @@ class Graphiti:
             )
             await has_episode_edge.save(self.driver)
 
+            # 【注释 79】saga 节点缓存首尾 episode，方便以后快速定位故事线边界，不必每次全量扫描边。
             # Track first and last episode on the saga node
             if saga_node.first_episode_uuid is None:
                 saga_node.first_episode_uuid = primary_episode.uuid
@@ -780,6 +860,7 @@ class Graphiti:
 
         return episodic_edges, primary_episode
 
+    # 【注释 80】批量路径先对所有 episode 同时抽取，再做内存级去重，减少重复 LLM/数据库工作。
     async def _extract_and_dedupe_nodes_bulk(
         self,
         episode_context: list[tuple[EpisodicNode, list[EpisodicNode]]],
@@ -794,6 +875,7 @@ class Graphiti:
         list[list[EntityEdge]],
     ]:
         """Extract nodes and edges from all episodes and deduplicate."""
+        # 【注释 81】这里一次性拿到 nodes 和 edges 的原始抽取结果；边暂时还可能指向未解析的节点 uuid。
         # Extract all nodes and edges for each episode
         extracted_nodes_bulk, extracted_edges_bulk = await extract_nodes_and_edges_bulk(
             self.clients,
@@ -805,6 +887,7 @@ class Graphiti:
             custom_extraction_instructions=custom_extraction_instructions,
         )
 
+        # 【注释 82】节点先去重，因为边端点解析依赖最终节点 uuid；这一步越早做，后续边处理越稳定。
         # Dedupe extracted nodes in memory
         nodes_by_episode, uuid_map = await dedupe_nodes_bulk(
             self.clients, extracted_nodes_bulk, episode_context, entity_types
@@ -812,6 +895,7 @@ class Graphiti:
 
         return nodes_by_episode, uuid_map, extracted_edges_bulk
 
+    # 【注释 83】bulk 解析阶段把“每个 episode 的局部抽取结果”合并成“全批次一致的节点和边”。
     async def _resolve_nodes_and_edges_bulk(
         self,
         nodes_by_episode: dict[str, list[EntityNode]],
@@ -823,10 +907,12 @@ class Graphiti:
         episodes: list[EpisodicNode],
     ) -> tuple[list[EntityNode], list[EntityEdge], list[EntityEdge], dict[str, str]]:
         """Resolve nodes and edges against the existing graph."""
+        # 【注释 84】先建立 uuid 到节点对象的索引，后面需要频繁根据 uuid 修正节点引用。
         nodes_by_uuid: dict[str, EntityNode] = {
             node.uuid: node for nodes in nodes_by_episode.values() for node in nodes
         }
 
+        # 【注释 85】为每个 episode 保留去重后的节点列表，同时避免同一个节点在全批次中重复解析。
         # Get unique nodes per episode
         nodes_by_episode_unique: dict[str, list[EntityNode]] = {}
         nodes_uuid_set: set[str] = set()
@@ -838,6 +924,7 @@ class Graphiti:
                     nodes_by_episode_unique[episode.uuid].append(node)
                     nodes_uuid_set.add(node.uuid)
 
+        # 【注释 86】节点解析仍按 episode 上下文并发执行，既保留局部语义，又利用 semaphore_gather 提升吞吐。
         # Resolve nodes
         node_results = await semaphore_gather(
             *[
@@ -852,16 +939,19 @@ class Graphiti:
             ]
         )
 
+        # 【注释 87】把每个 episode 的解析结果汇总到全局列表，并合并所有临时 uuid 到真实 uuid 的映射。
         resolved_nodes: list[EntityNode] = []
         uuid_map: dict[str, str] = {}
         for result in node_results:
             resolved_nodes.extend(result[0])
             uuid_map.update(result[1])
 
+        # 【注释 88】解析后可能出现新 uuid 或合并到旧节点，因此要刷新索引，保证后续引用拿到最终节点对象。
         # Update nodes_by_uuid with resolved nodes
         for resolved_node in resolved_nodes:
             nodes_by_uuid[resolved_node.uuid] = resolved_node
 
+        # 【注释 89】这里把每个 episode 的节点列表也改写为解析后的节点，避免后面属性抽取使用过期指针。
         # Update nodes_by_episode_unique with resolved pointers
         for episode_uuid, nodes in nodes_by_episode_unique.items():
             updated_nodes: list[EntityNode] = []
@@ -871,6 +961,7 @@ class Graphiti:
                 updated_nodes.append(updated_node)
             nodes_by_episode_unique[episode_uuid] = updated_nodes
 
+        # 【注释 90】属性抽取放在节点解析之后，确保属性补充到最终节点，而不是补到会被合并掉的临时节点。
         # Extract attributes for resolved nodes
         hydrated_nodes_results: list[list[EntityNode]] = await semaphore_gather(
             *[
@@ -885,8 +976,10 @@ class Graphiti:
             ]
         )
 
+        # 【注释 91】将并发得到的二维节点列表拍平成最终要保存的节点集合。
         final_hydrated_nodes = [node for nodes in hydrated_nodes_results for node in nodes]
 
+        # 【注释 92】边在节点 uuid 稳定后再去重和解析，避免同一事实因为端点 uuid 不同被误判为多条边。
         # Resolve edges with updated pointers
         edges_by_episode_unique: dict[str, list[EntityEdge]] = {}
         edges_uuid_set: set[str] = set()
@@ -899,6 +992,7 @@ class Graphiti:
                     edges_by_episode_unique[episode_uuid].append(edge)
                     edges_uuid_set.add(edge.uuid)
 
+        # 【注释 93】每个 episode 的边解析可并发执行，但共享同一批最终节点作为事实端点参照。
         edge_results = await semaphore_gather(
             *[
                 resolve_extracted_edges(
@@ -913,6 +1007,7 @@ class Graphiti:
             ]
         )
 
+        # 【注释 94】汇总边解析结果时保留 resolved 和 invalidated 两类，后续一起写入以表达事实更新。
         resolved_edges: list[EntityEdge] = []
         invalidated_edges: list[EntityEdge] = []
         for result in edge_results:
@@ -923,7 +1018,9 @@ class Graphiti:
 
         return final_hydrated_nodes, resolved_edges, invalidated_edges, uuid_map
 
+    # 【注释 95】该装饰器让方法可以透明处理多个 group_id；方法内部仍按列表语义传给底层检索函数。
     @handle_multiple_group_ids
+    # 【注释 96】retrieve_episodes 是上下文检索入口：给定参考时间，找出最近 episode 作为新抽取的历史背景。
     async def retrieve_episodes(
         self,
         reference_time: datetime,
@@ -964,6 +1061,7 @@ class Graphiti:
         The actual retrieval is performed by the `retrieve_episodes` function
         from the `graphiti_core.utils` module, unless a saga is specified.
         """
+        # 【注释 97】允许调用方传入临时 driver；未传时默认使用 Graphiti 当前 clients 中的 driver。
         if driver is None:
             driver = self.clients.driver
 
@@ -975,8 +1073,10 @@ class Graphiti:
             except NotImplementedError:
                 pass
 
+        # 【注释 98】通用回退路径把参数原样交给 maintenance 层的 retrieve_episodes 函数。
         return await retrieve_episodes(driver, reference_time, last_n, group_ids, source, saga)
 
+    # 【注释 99】add_episode 是单条写入主流程：校验参数、准备上下文、抽取节点/边、解析去重、落库并可选更新社区。
     async def add_episode(
         self,
         name: str,
@@ -1064,12 +1164,15 @@ class Graphiti:
                 background_tasks.add_task(graphiti.add_episode, **episode_data.dict())
                 return {"message": "Episode processing started"}
         """
+        # 【注释 100】先记录耗时和当前时间；reference_time 表示事件时间，now 表示系统处理时间，两者语义不同。
         start = time()
         now = utc_now()
 
+        # 【注释 101】写入前先校验自定义实体类型和排除类型，避免无效 schema 进入 LLM 抽取阶段。
         validate_entity_types(entity_types)
         validate_excluded_entity_types(excluded_entity_types, entity_types)
 
+        # 【注释 102】group_id 决定图分区/数据库；未传时使用 driver provider 的默认分区。
         if group_id is None:
             # if group_id is None, use the default group id by the provider
             # and the preset database name will be used
@@ -1081,8 +1184,10 @@ class Graphiti:
                 self.driver = self.driver.clone(database=group_id)
                 self.clients.driver = self.driver
 
+        # 【注释 103】从这里开始进入可观测的核心流程，异常和耗时都会记录到同一个 span。
         with self.tracer.start_span('add_episode') as span:
             try:
+                # 【注释 104】先拿历史 episode，是因为实体/边抽取需要上下文来判断新信息、旧信息和冲突信息。
                 # Retrieve previous episodes for context
                 previous_episodes = (
                     await self.retrieve_episodes(
@@ -1095,6 +1200,7 @@ class Graphiti:
                     else await EpisodicNode.get_by_uuids(self.driver, previous_episode_uuids)
                 )
 
+                # 【注释 105】如果传入 uuid，说明可能是重跑或补处理，优先读取已有 episode；否则按输入创建新节点。
                 # Get or create episode
                 episode = (
                     await EpisodicNode.get_by_uuid(self.driver, uuid)
@@ -1111,6 +1217,7 @@ class Graphiti:
                     )
                 )
 
+                # 【注释 106】edge_type_map 决定哪些实体类型之间允许抽取哪些边；未传时默认允许 Entity-Entity 的通用关系。
                 # Create default edge type map
                 edge_type_map_default = (
                     {('Entity', 'Entity'): list(edge_types.keys())}
@@ -1118,6 +1225,7 @@ class Graphiti:
                     else {('Entity', 'Entity'): []}
                 )
 
+                # 【注释 107】节点先于边处理：只有实体稳定后，事实边的 source/target 才能稳定。
                 # Extract and resolve nodes
                 extracted_nodes, node_episode_index_map = await extract_nodes(
                     self.clients,
@@ -1128,6 +1236,7 @@ class Graphiti:
                     custom_extraction_instructions,
                 )
 
+                # 【注释 108】这里忽略 duplicates，但保留 uuid_map；后续边端点必须根据这个映射修正。
                 nodes, uuid_map, _ = await resolve_extracted_nodes(
                     self.clients,
                     extracted_nodes,
@@ -1136,6 +1245,7 @@ class Graphiti:
                     entity_types,
                 )
 
+                # 【注释 109】这段实际先解析边，再用 new_edges 辅助节点属性摘要，避免旧事实反复写入节点 summary。
                 # Extract and resolve edges in parallel with attribute extraction
                 (
                     resolved_edges,
@@ -1153,8 +1263,10 @@ class Graphiti:
                     custom_extraction_instructions,
                 )
 
+                # 【注释 110】保存时把新解析出的边和被新事实失效的边都带上，让图谱能表达事实随时间变化。
                 entity_edges = resolved_edges + invalidated_edges
 
+                # 【注释 111】节点属性补全依赖最终节点集合和新增事实，目的是增强节点内容而不是复制已有事实。
                 # Extract node attributes - only pass new edges for summary generation
                 # to avoid duplicating facts that already exist in the graph
                 hydrated_nodes = await extract_attributes_from_nodes(
@@ -1166,6 +1278,7 @@ class Graphiti:
                     edges=new_edges,
                 )
 
+                # 【注释 112】所有抽取/解析完成后再统一写图，并在同一阶段处理 saga 归属，保证引用的 uuid 都已稳定。
                 # Process and save episode data (including saga association if provided)
                 episodic_edges, episode = await self._process_episode_data(
                     episode,
@@ -1178,6 +1291,7 @@ class Graphiti:
                     node_episode_index_map,
                 )
 
+                # 【注释 113】社区更新是可选的高成本操作，只在调用方显式要求时根据本次涉及的节点增量更新。
                 # Update communities if requested
                 communities = []
                 community_edges = []
@@ -1192,6 +1306,7 @@ class Graphiti:
 
                 end = time()
 
+                # 【注释 114】核心流程结束后写入观测指标：数量、耗时和配置能帮助排查抽取质量或性能问题。
                 # Add span attributes
                 span.add_attributes(
                     {
@@ -1213,6 +1328,7 @@ class Graphiti:
 
                 logger.info(f'Completed add_episode in {(end - start) * 1000} ms')
 
+                # 【注释 115】最后返回结构化结果，调用方可以继续使用新 episode.uuid、节点和边做后续处理。
                 return AddEpisodeResults(
                     episode=episode,
                     episodic_edges=episodic_edges,
@@ -1222,11 +1338,13 @@ class Graphiti:
                     community_edges=community_edges,
                 )
 
+            # 【注释 116】异常路径先标记 span，再重新抛出，既不吞错误，也保留可观测性信息。
             except Exception as e:
                 span.set_status('error', str(e))
                 span.record_exception(e)
                 raise e
 
+    # 【注释 117】add_episode_bulk 是批量写入主流程：尽量把 I/O、抽取和去重批处理化，降低大量 episode 写入的总成本。
     async def add_episode_bulk(
         self,
         bulk_episodes: list[RawEpisode],
@@ -1292,14 +1410,17 @@ class Graphiti:
         ``resolve_extracted_edges`` just like in ``add_episode``, and any invalidated
         edges are persisted alongside the newly resolved ones.
         """
+        # 【注释 118】批处理使用独立 span，并先记录 episode.count，便于和单条写入的性能指标区分。
         with self.tracer.start_span('add_episode_bulk') as bulk_span:
             bulk_span.add_attributes({'episode.count': len(bulk_episodes)})
 
             try:
+                # 【注释 119】批处理同样区分处理时间 now 和每条 episode 自己的 reference_time。
                 start = time()
                 now = utc_now()
 
                 # if group_id is None, use the default group id by the provider
+                # 【注释 120】批量写入要求整批 episode 属于同一 group/database；必要时克隆 driver 指向目标数据库。
                 if group_id is None:
                     group_id = get_default_group_id(self.driver.provider)
                 else:
@@ -1309,6 +1430,7 @@ class Graphiti:
                         self.driver = self.driver.clone(database=group_id)
                         self.clients.driver = self.driver
 
+                # 【注释 121】批量路径沿用单条路径的边类型默认策略，保证两种入口的 schema 行为一致。
                 # Create default edge type map
                 edge_type_map_default = (
                     {('Entity', 'Entity'): list(edge_types.keys())}
@@ -1316,6 +1438,7 @@ class Graphiti:
                     else {('Entity', 'Entity'): []}
                 )
 
+                # 【注释 122】先把 RawEpisode 转成 EpisodicNode；有 uuid 的走复用，无 uuid 的创建新节点。
                 episodes = [
                     await EpisodicNode.get_by_uuid(self.driver, episode.uuid)
                     if episode.uuid is not None
@@ -1332,6 +1455,7 @@ class Graphiti:
                     for episode in bulk_episodes
                 ]
 
+                # 【注释 123】先保存 episode 本体，是为了让后续检索上下文和构建来源关系时有稳定的 episode uuid。
                 # Save all episodes
                 await add_nodes_and_edges_bulk(
                     driver=self.driver,
@@ -1342,9 +1466,11 @@ class Graphiti:
                     embedder=self.embedder,
                 )
 
+                # 【注释 124】为每条新 episode 分别取历史上下文，避免批量处理时丢失时间邻近信息。
                 # Get previous episode context for each episode
                 episode_context = await retrieve_previous_episodes_bulk(self.driver, episodes)
 
+                # 【注释 125】批量抽取后立刻对节点去重，减少后续解析和属性抽取的重复工作。
                 # Extract and dedupe nodes and edges
                 (
                     nodes_by_episode,
@@ -1359,11 +1485,13 @@ class Graphiti:
                     custom_extraction_instructions,
                 )
 
+                # 【注释 126】根据每个 episode 的节点结果生成来源边，保证批量写入也能追溯实体来自哪条输入。
                 # Create Episodic Edges
                 episodic_edges: list[EpisodicEdge] = []
                 for episode_uuid, nodes in nodes_by_episode.items():
                     episodic_edges.extend(build_episodic_edges(nodes, episode_uuid, now))
 
+                # 【注释 127】节点 uuid 修正后再对边去重，避免同一事实因临时端点不同被保留多次。
                 # Re-map edge pointers and dedupe edges
                 extracted_edges_bulk_updated: list[list[EntityEdge]] = [
                     resolve_edge_pointers(edges, uuid_map) for edges in extracted_edges_bulk
@@ -1378,6 +1506,7 @@ class Graphiti:
                     edge_type_map or edge_type_map_default,
                 )
 
+                # 【注释 128】这一步把本批候选知识与已有图谱合并，同时找出被新信息 invalidated 的旧边。
                 # Resolve nodes and edges against the existing graph
                 (
                     final_hydrated_nodes,
@@ -1394,9 +1523,11 @@ class Graphiti:
                     episodes,
                 )
 
+                # 【注释 129】节点解析后，episode-to-entity 边也要修正端点，确保来源边指向最终实体节点。
                 # Resolved pointers for episodic edges
                 resolved_episodic_edges = resolve_edge_pointers(episodic_edges, final_uuid_map)
 
+                # 【注释 130】最终一次性写入 episode、来源边、实体节点和事实边，这是批量路径的主要性能收益。
                 # save data to KG
                 await add_nodes_and_edges_bulk(
                     self.driver,
@@ -1407,9 +1538,11 @@ class Graphiti:
                     self.embedder,
                 )
 
+                # 【注释 131】批量 saga 关联需要额外维护顺序链：不仅要建立归属，还要在整批 episode 内按时间连接。
                 # Handle saga association if provided
                 if saga is not None:
                     # Get or create saga node based on input type
+                    # 【注释 132】传入 saga 名时按需创建；批量创建的 saga created_at 使用最早 episode 的事件时间。
                     if isinstance(saga, str):
                         # Anchor a newly minted saga to the earliest episode
                         # reference time in the bulk, so created_at reflects the
@@ -1420,14 +1553,17 @@ class Graphiti:
                     else:
                         saga_node = saga
 
+                    # 【注释 133】排序后再建 NEXT_EPISODE，避免输入列表顺序和真实事件时间不一致导致故事线错乱。
                     # Sort episodes by valid_at to create NEXT_EPISODE chain in correct order
                     sorted_episodes = sorted(episodes, key=lambda e: e.valid_at)
 
+                    # 【注释 134】先找到 saga 中已有的最后一条 episode，才能把本批第一条正确接到旧链尾部。
                     # Find the most recent episode already in the saga
                     previous_episode_uuid = await self._saga_get_previous_episode_uuid(
                         saga_node.uuid, ''
                     )
 
+                    # 【注释 135】循环中每处理一条就更新 previous_episode_uuid，从而把本批 episode 串成连续链。
                     for episode in sorted_episodes:
                         # Create NEXT_EPISODE edge from the previous episode
                         if previous_episode_uuid is not None:
@@ -1451,6 +1587,7 @@ class Graphiti:
                         # Update previous_episode_uuid for the next iteration
                         previous_episode_uuid = episode.uuid
 
+                    # 【注释 136】批量结束后更新 saga 首尾缓存；first 只在为空时设置，last 总是推进到本批最后一条。
                     # Track first and last episode on the saga node
                     if sorted_episodes:
                         if saga_node.first_episode_uuid is None:
@@ -1460,6 +1597,7 @@ class Graphiti:
 
                 end = time()
 
+                # 【注释 137】批量观测指标重点记录 group、节点数、边数和总耗时，用于评估批处理效率。
                 # Add span attributes
                 bulk_span.add_attributes(
                     {
@@ -1472,6 +1610,7 @@ class Graphiti:
 
                 logger.info(f'Completed add_episode_bulk in {(end - start) * 1000} ms')
 
+                # 【注释 138】批量返回包含所有 episode 和最终写入的节点/边；社区字段保持空，因为该路径没有更新社区。
                 return AddBulkEpisodeResults(
                     episodes=episodes,
                     episodic_edges=resolved_episodic_edges,
@@ -1481,12 +1620,15 @@ class Graphiti:
                     community_edges=[],
                 )
 
+            # 【注释 139】批量异常同样写入 span 后抛出，调用方可以决定是否重试整批或拆分处理。
             except Exception as e:
                 bulk_span.set_status('error', str(e))
                 bulk_span.record_exception(e)
                 raise e
 
+    # 【注释 140】build_communities 也支持多 group：社区可以按指定分区构建，也可以覆盖整个图。
     @handle_multiple_group_ids
+    # 【注释 141】社区构建是全局维护操作：先清理旧社区，再基于当前实体图重新聚类和摘要。
     async def build_communities(
         self, group_ids: list[str] | None = None, driver: GraphDriver | None = None
     ) -> tuple[list[CommunityNode], list[CommunityEdge]]:
@@ -1497,12 +1639,15 @@ class Graphiti:
         group_ids : list[str] | None
             Optional. Create communities only for the listed group_ids. If blank the entire graph will be used.
         """
+        # 【注释 142】可选 driver 让维护任务能针对指定后端运行；默认仍使用当前实例 driver。
         if driver is None:
             driver = self.clients.driver
 
+        # 【注释 143】先删除旧社区，避免新旧聚类结果并存造成搜索或展示时的重复/冲突。
         # Clear existing communities
         await remove_communities(driver)
 
+        # 【注释 144】底层 build_communities 负责真正的聚类与摘要生成，Graphiti 负责后续嵌入和保存。
         community_nodes, community_edges = await build_communities(
             driver, self.llm_client, group_ids
         )
@@ -1523,7 +1668,9 @@ class Graphiti:
 
         return community_nodes, community_edges
 
+    # 【注释 145】search 同样经过 group_id 装饰器，使同一个查询可以限定在一个或多个图分区。
     @handle_multiple_group_ids
+    # 【注释 146】search 是简单事实检索入口：返回 EntityEdge 列表，适合只需要相关事实而不需要完整图对象的场景。
     async def search(
         self,
         query: str,
@@ -1566,11 +1713,14 @@ class Graphiti:
         The search is performed using the current date and time as the reference
         point for temporal relevance.
         """
+        # 【注释 147】是否传 center_node_uuid 决定重排策略：无中心节点用 RRF，有中心节点则考虑图距离。
         search_config = (
             EDGE_HYBRID_SEARCH_RRF if center_node_uuid is None else EDGE_HYBRID_SEARCH_NODE_DISTANCE
         )
+        # 【注释 148】这里直接修改 config 的 limit，使外部 num_results 参数影响底层搜索结果数量。
         search_config.limit = num_results
 
+        # 【注释 149】底层 search 返回 SearchResults；这个简化接口只取其中的 edges。
         edges = (
             await search(
                 self.clients,
@@ -1585,6 +1735,7 @@ class Graphiti:
 
         return edges
 
+    # 【注释 150】_search 是兼容旧接口的薄包装，所有实际逻辑都转发给新的 search_。
     async def _search(
         self,
         query: str,
@@ -1595,11 +1746,14 @@ class Graphiti:
         search_filter: SearchFilters | None = None,
     ) -> SearchResults:
         """DEPRECATED"""
+        # 【注释 151】保留该方法可以减少破坏性变更，让旧调用方逐步迁移。
         return await self.search_(
             query, config, group_ids, center_node_uuid, bfs_origin_node_uuids, search_filter
         )
 
+    # 【注释 152】search_ 是高级检索入口，也支持多 group，并保留更多搜索配置能力。
     @handle_multiple_group_ids
+    # 【注释 153】search_ 返回完整 SearchResults，调用方可以同时拿到节点、边和更复杂的检索结果。
     async def search_(
         self,
         query: str,
@@ -1628,9 +1782,12 @@ class Graphiti:
             driver=driver,
         )
 
+    # 【注释 154】该方法从 episode 反查它提到的节点和关联的事实边，用于解释某条输入贡献了哪些图谱内容。
     async def get_nodes_and_edges_by_episode(self, episode_uuids: list[str]) -> SearchResults:
+        # 【注释 155】先取 episode 节点，因为实体边 uuid 存在 episode.entity_edges 中。
         episodes = await EpisodicNode.get_by_uuids(self.driver, episode_uuids)
 
+        # 【注释 156】每个 episode 的边可以并发读取，最后再拍平成一个边列表。
         edges_list = await semaphore_gather(
             *[EntityEdge.get_by_uuids(self.driver, episode.entity_edges) for episode in episodes],
             max_coroutines=self.max_coroutines,
@@ -1638,13 +1795,16 @@ class Graphiti:
 
         edges: list[EntityEdge] = [edge for lst in edges_list for edge in lst]
 
+        # 【注释 157】节点不从 entity_edges 反推，而是通过 MENTIONS 关系获取，能保留 episode 对实体的直接来源关系。
         nodes = await get_mentioned_nodes(self.driver, episodes)
 
         return SearchResults(edges=edges, nodes=nodes)
 
+    # 【注释 158】add_triplet 是手工事实写入入口：调用方直接给 source、edge、target，系统负责补嵌入、解析冲突并落库。
     async def add_triplet(
         self, source_node: EntityNode, edge: EntityEdge, target_node: EntityNode
     ) -> AddTripletResults:
+        # 【注释 159】写入前先确保两个端点和事实边都有嵌入，便于后续检索和去重。
         if source_node.name_embedding is None:
             await source_node.generate_name_embedding(self.embedder)
         if target_node.name_embedding is None:
@@ -1652,6 +1812,7 @@ class Graphiti:
         if edge.fact_embedding is None:
             await edge.generate_embedding(self.embedder)
 
+        # 【注释 160】先尝试按 uuid 找已有 source 节点；找不到时再走节点解析，避免无谓创建重复实体。
         try:
             resolved_source = await EntityNode.get_by_uuid(self.driver, source_node.uuid)
         except NodeNotFoundError:
@@ -1661,6 +1822,7 @@ class Graphiti:
             )
             resolved_source = resolved_source_nodes[0]
 
+        # 【注释 161】target 节点使用同样策略，确保手工传入的端点也会与已有图谱对齐。
         try:
             resolved_target = await EntityNode.get_by_uuid(self.driver, target_node.uuid)
         except NodeNotFoundError:
@@ -1670,8 +1832,10 @@ class Graphiti:
             )
             resolved_target = resolved_target_nodes[0]
 
+        # 【注释 162】后续只保存解析后的端点节点，原始节点对象只作为属性补充来源。
         nodes = [resolved_source, resolved_target]
 
+        # 【注释 163】用户传入的 attributes、summary、labels 会合并进解析后的节点，既保留已有实体身份，也吸收新属性。
         # Merge user-provided properties from original nodes into resolved nodes (excluding uuid)
         # Update attributes dictionary (merge rather than replace)
         if source_node.attributes:
@@ -1691,9 +1855,11 @@ class Graphiti:
         if target_node.labels:
             resolved_target.labels = list(set(resolved_target.labels) | set(target_node.labels))
 
+        # 【注释 164】边端点必须改成解析后的 uuid，否则可能指向临时或重复节点。
         edge.source_node_uuid = resolved_source.uuid
         edge.target_node_uuid = resolved_target.uuid
 
+        # 【注释 165】边 uuid 冲突时要特别处理：同 uuid 但端点不同不能覆盖旧边，只能生成新 uuid。
         # Check if an edge with this UUID already exists with different source/target nodes.
         # If so, generate a new UUID to create a new edge instead of overwriting.
         try:
@@ -1714,10 +1880,12 @@ class Graphiti:
             # Edge doesn't exist yet, proceed normally
             pass
 
+        # 【注释 166】先取两个端点之间已有边，作为判断当前事实是否重复或冲突的局部上下文。
         valid_edges = await EntityEdge.get_between_nodes(
             self.driver, edge.source_node_uuid, edge.target_node_uuid
         )
 
+        # 【注释 167】related_edges 限定在两端点已有边中搜索，用于判断同一对实体之间的相似事实。
         related_edges = (
             await search(
                 self.clients,
@@ -1727,6 +1895,7 @@ class Graphiti:
                 search_filter=SearchFilters(edge_uuids=[edge.uuid for edge in valid_edges]),
             )
         ).edges
+        # 【注释 168】existing_edges 在整个 group 内搜索，用于发现更广范围内可能重复或冲突的事实。
         existing_edges = (
             await search(
                 self.clients,
@@ -1737,6 +1906,7 @@ class Graphiti:
             )
         ).edges
 
+        # 【注释 169】即使是手工 triplet，也复用自动抽取边的解析逻辑，保证 invalidation 规则一致。
         resolved_edge, invalidated_edges, _ = await resolve_extracted_edge(
             self.llm_client,
             edge,
@@ -1754,32 +1924,41 @@ class Graphiti:
             None,
         )
 
+        # 【注释 170】最终要写入的不只是新边，还包括因为该事实而失效的旧边。
         edges: list[EntityEdge] = [resolved_edge] + invalidated_edges
 
+        # 【注释 171】解析后的边和节点再统一生成嵌入，确保写入图谱的数据都可被搜索。
         await create_entity_edge_embeddings(self.embedder, edges)
         await create_entity_node_embeddings(self.embedder, nodes)
 
+        # 【注释 172】triplet 没有 episode 来源，因此只写实体节点和实体边，episode/episodic_edges 参数为空。
         await add_nodes_and_edges_bulk(self.driver, [], [], nodes, edges, self.embedder)
         return AddTripletResults(edges=edges, nodes=nodes)
 
+    # 【注释 173】remove_episode 只删除由该 episode 独占产生的内容，避免误删其他 episode 仍在引用的知识。
     async def remove_episode(self, episode_uuid: str):
+        # 【注释 174】删除从 episode 本体开始，因为后续需要它记录的 entity_edges 和 MENTIONS 关系。
         # Find the episode to be deleted
         episode = await EpisodicNode.get_by_uuid(self.driver, episode_uuid)
 
+        # 【注释 175】先读取 episode 关联的事实边，但并不是所有关联边都能删除。
         # Find edges mentioned by the episode
         edges = await EntityEdge.get_by_uuids(self.driver, episode.entity_edges)
 
+        # 【注释 176】只有 edge.episodes 的第一条就是当前 episode 时，才认为该边由它创建，可安全删除。
         # We should only delete edges created by the episode
         edges_to_delete: list[EntityEdge] = []
         for edge in edges:
             if edge.episodes and edge.episodes[0] == episode.uuid:
                 edges_to_delete.append(edge)
 
+        # 【注释 177】节点删除更谨慎：先找到该 episode 提到的节点，再确认这些节点没有被其他 episode 提到。
         # Find nodes mentioned by the episode
         nodes = await get_mentioned_nodes(self.driver, [episode])
         # We should delete all nodes that are only mentioned in the deleted episode
         nodes_to_delete: list[EntityNode] = []
         for node in nodes:
+            # 【注释 178】这里用计数判断节点是否只有当前 episode 一个来源，防止删除共享实体。
             query: LiteralString = 'MATCH (e:Episodic)-[:MENTIONS]->(n:Entity {uuid: $uuid}) RETURN count(*) AS episode_count'
             records, _, _ = await self.driver.execute_query(query, uuid=node.uuid, routing_='r')
 
@@ -1787,7 +1966,9 @@ class Graphiti:
                 if record['episode_count'] == 1:
                     nodes_to_delete.append(node)
 
+        # 【注释 179】先删边再删节点，符合图数据库中删除节点前应先清理相关边的常见约束。
         await Edge.delete_by_uuids(self.driver, [edge.uuid for edge in edges_to_delete])
         await Node.delete_by_uuids(self.driver, [node.uuid for node in nodes_to_delete])
 
+        # 【注释 180】最后删除 episode 本身；此时它独占的边和节点已经清理完毕。
         await episode.delete(self.driver)
