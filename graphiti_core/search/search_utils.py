@@ -14,6 +14,19 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+# 这个文件是 Graphiti 检索链路中的底层 search utils。
+# 它不负责“高层 search 策略编排”，而是提供具体的检索原语：
+# - fulltext search：基于 BM25 / Lucene / 图数据库全文索引；
+# - similarity search：基于 embedding 向量相似度；
+# - BFS search：基于图结构邻域扩展；
+# - reranker：RRF、node distance、episode mentions、MMR；
+# - embedding loader：为后续 rerank 或相似度计算批量取回 embedding。
+#
+# 阅读顺序建议：
+# 1. 先看常量和 fulltext_query，理解查询字符串怎么构造；
+# 2. 再看 edge/node/episode/community 四类搜索函数；
+# 3. 然后看 hybrid_node_search 和 get_relevant_*，它们是组合检索；
+# 4. 最后看 reranker 和 embedding loader。
 import logging
 from collections import defaultdict
 from time import time
@@ -61,6 +74,8 @@ from graphiti_core.search.search_filters import (
 
 logger = logging.getLogger(__name__)
 
+# 这些常量控制默认召回规模、相似度阈值、图遍历深度和全文查询长度。
+# 其中 RELEVANT_SCHEMA_LIMIT 在 add_episode 的上下文召回、节点/边去重候选召回中也经常出现。
 RELEVANT_SCHEMA_LIMIT = 10
 DEFAULT_MIN_SCORE = 0.6
 DEFAULT_MMR_LAMBDA = 0.5
@@ -68,6 +83,8 @@ MAX_SEARCH_DEPTH = 3
 MAX_QUERY_LENGTH = 128
 
 
+# 基础向量工具函数。
+# 大多数图数据库可以直接算 cosine similarity；Neptune 等场景下可能需要把 embedding 取出来后在 Python 里算。
 def calculate_cosine_similarity(vector1: list[float], vector2: list[float]) -> float:
     """
     Calculates the cosine similarity between two vectors using NumPy.
@@ -82,16 +99,28 @@ def calculate_cosine_similarity(vector1: list[float], vector2: list[float]) -> f
     return dot_product / (norm_vector1 * norm_vector2)
 
 
+# 构造全文检索查询字符串。
+# 这个函数的核心职责是：
+# 1. 校验 group_ids；
+# 2. 根据不同图数据库生成不同全文检索语法；
+# 3. 给普通 Lucene 查询加 group_id 过滤；
+# 4. 对 query 做 sanitize，避免特殊字符破坏全文查询。
 def fulltext_query(query: str, group_ids: list[str] | None, driver: GraphDriver):
     validate_group_ids(group_ids)
 
+    # Kuzu 当前只支持更简单的全文查询，所以不拼复杂 Lucene 语法。
     if driver.provider == GraphProvider.KUZU:
         # Kuzu only supports simple queries.
         if len(query.split(' ')) > MAX_QUERY_LENGTH:
             return ''
         return query
+
+    # FalkorDB 把全文查询构造下放给 driver，因为它有自己的语法要求。
     elif driver.provider == GraphProvider.FALKORDB:
         return driver.build_fulltext_query(query, group_ids, MAX_QUERY_LENGTH)
+
+    # 其他 provider 使用 Lucene 风格查询。
+    # group_ids 会被拼成 group_id:"xxx" OR group_id:"yyy" 的过滤表达式。
     group_ids_filter_list = (
         [driver.fulltext_syntax + f'group_id:"{g}"' for g in group_ids]
         if group_ids is not None
@@ -104,7 +133,9 @@ def fulltext_query(query: str, group_ids: list[str] | None, driver: GraphDriver)
     group_ids_filter += ' AND ' if group_ids_filter else ''
 
     lucene_query = lucene_sanitize(query)
+
     # If the lucene query is too long return no query
+    # 查询太长时直接返回空字符串，上层搜索函数会返回空结果，避免打爆全文索引。
     if len(lucene_query.split(' ')) + len(group_ids or '') >= MAX_QUERY_LENGTH:
         return ''
 
@@ -113,6 +144,8 @@ def fulltext_query(query: str, group_ids: list[str] | None, driver: GraphDriver)
     return full_query
 
 
+# 根据一批 edge 的 episodes 字段反查相关 EpisodicNode。
+# 这通常用于从事实边追溯到原始 episode 证据。
 async def get_episodes_by_mentions(
     driver: GraphDriver,
     nodes: list[EntityNode],
@@ -128,9 +161,14 @@ async def get_episodes_by_mentions(
     return episodes
 
 
+# 根据 episode 找它提到过的实体节点。
+# 在图结构上就是走：
+#   Episodic -[:MENTIONS]-> Entity
 async def get_mentioned_nodes(
     driver: GraphDriver, episodes: list[EpisodicNode]
 ) -> list[EntityNode]:
+    # 如果底层 driver 提供了 graph_operations_interface，优先使用 driver 的专用实现。
+    # 这让不同后端可以用更高效或更兼容的查询方式。
     if driver.graph_operations_interface:
         try:
             return await driver.graph_operations_interface.get_mentioned_nodes(driver, episodes)
@@ -155,6 +193,9 @@ async def get_mentioned_nodes(
     return nodes
 
 
+# 根据实体节点找到它们所在的 community。
+# Community 是实体节点聚类后的上层摘要节点，这里走：
+#   Community -[:HAS_MEMBER]-> Entity
 async def get_communities_by_nodes(
     driver: GraphDriver, nodes: list[EntityNode]
 ) -> list[CommunityNode]:
@@ -182,6 +223,8 @@ async def get_communities_by_nodes(
     return communities
 
 
+# EntityEdge 的全文检索。
+# 搜索对象是边上的 name/fact，也就是“事实文本”和“关系名称”。
 async def edge_fulltext_search(
     driver: GraphDriver,
     query: str,
@@ -189,6 +232,7 @@ async def edge_fulltext_search(
     group_ids: list[str] | None = None,
     limit=RELEVANT_SCHEMA_LIMIT,
 ) -> list[EntityEdge]:
+    # 如果 driver 有专用 search_interface，优先委托给后端实现。
     if driver.search_interface:
         return await driver.search_interface.edge_fulltext_search(
             driver, query, search_filter, group_ids, limit
@@ -200,16 +244,20 @@ async def edge_fulltext_search(
     if fuzzy_query == '':
         return []
 
+    # 默认图模型里，EntityEdge 是 Entity-[:RELATES_TO]->Entity。
     match_query = """
     YIELD relationship AS rel, score
     MATCH (n:Entity)-[e:RELATES_TO {uuid: rel.uuid}]->(m:Entity)
     """
+
+    # Kuzu 把关系实体化成 RelatesToNode_ 中间节点，所以匹配方式不同。
     if driver.provider == GraphProvider.KUZU:
         match_query = """
         YIELD node, score
         MATCH (n:Entity)-[:RELATES_TO]->(e:RelatesToNode_ {uuid: node.uuid})-[:RELATES_TO]->(m:Entity)
         """
 
+    # SearchFilters 会被转换成数据库可执行的 WHERE 子句。
     filter_queries, filter_params = edge_search_filter_query_constructor(
         search_filter, driver.provider
     )
@@ -222,6 +270,7 @@ async def edge_fulltext_search(
     if filter_queries:
         filter_query = ' WHERE ' + (' AND '.join(filter_queries))
 
+    # Neptune 使用 AOSS 做全文检索，再把命中的 uuid 回查图数据库。
     if driver.provider == GraphProvider.NEPTUNE:
         res = driver.run_aoss_query('edge_name_and_fact', query)  # pyright: ignore reportAttributeAccessIssue
         if res['hits']['total']['value'] > 0:
@@ -269,6 +318,7 @@ async def edge_fulltext_search(
         else:
             return []
     else:
+        # 非 Neptune 后端使用图数据库的全文索引查询，再回到边结构上返回标准 EntityEdge 字段。
         query = (
             get_relationships_query('edge_name_and_fact', limit=limit, provider=driver.provider)
             + match_query
@@ -297,6 +347,8 @@ async def edge_fulltext_search(
     return edges
 
 
+# EntityEdge 的向量相似度检索。
+# 搜索对象是 edge.fact_embedding，也就是事实文本的 embedding。
 async def edge_similarity_search(
     driver: GraphDriver,
     search_vector: list[float],
@@ -331,6 +383,8 @@ async def edge_similarity_search(
         search_filter, driver.provider
     )
 
+    # group_id 限制用于隔离图空间。
+    # source_node_uuid / target_node_uuid 用于把检索限制在某一对实体之间，常见于 edge 去重。
     if group_ids is not None:
         filter_queries.append('e.group_id IN $group_ids')
         filter_params['group_ids'] = group_ids
@@ -347,10 +401,12 @@ async def edge_similarity_search(
     if filter_queries:
         filter_query = ' WHERE ' + (' AND '.join(filter_queries))
 
+    # Kuzu 需要显式 cast 向量维度。
     search_vector_var = '$search_vector'
     if driver.provider == GraphProvider.KUZU:
         search_vector_var = f'CAST($search_vector AS FLOAT[{len(search_vector)}])'
 
+    # Neptune 分支：先取出候选 embedding，在 Python 里算 cosine，再按 id 回查完整边。
     if driver.provider == GraphProvider.NEPTUNE:
         query = (
             """
@@ -414,6 +470,7 @@ async def edge_similarity_search(
         else:
             return []
     else:
+        # 其他后端直接在查询中计算 cosine score。
         query = (
             match_query
             + filter_query
@@ -445,6 +502,8 @@ async def edge_similarity_search(
     return edges
 
 
+# 基于图结构的 edge BFS 搜索。
+# 它不是看文本相似度，而是从一组起点 node/episode 出发，在 RELATES_TO / MENTIONS 邻域内找事实边。
 async def edge_bfs_search(
     driver: GraphDriver,
     bfs_origin_node_uuids: list[str] | None,
@@ -462,6 +521,7 @@ async def edge_bfs_search(
             pass
 
     # vector similarity search over embedded facts
+    # 没有 BFS 起点就无法做图邻域搜索。
     if bfs_origin_node_uuids is None or len(bfs_origin_node_uuids) == 0:
         return []
 
@@ -480,6 +540,7 @@ async def edge_bfs_search(
     if driver.provider == GraphProvider.KUZU:
         # Kuzu stores entity edges twice with an intermediate node, so we need to match them
         # separately for the correct BFS depth.
+        # Kuzu 的 RELATES_TO 通过中间 RelatesToNode_ 表达，因此图路径深度需要换算。
         depth = bfs_max_depth * 2 - 1
         match_queries = [
             f"""
@@ -545,6 +606,7 @@ async def edge_bfs_search(
                 """
             )
         else:
+            # 默认 Cypher 后端可以从 Entity 或 Episodic 起点沿 RELATES_TO / MENTIONS 扩展。
             query = (
                 f"""
                 UNWIND $bfs_origin_node_uuids AS origin_uuid
@@ -576,6 +638,8 @@ async def edge_bfs_search(
     return edges
 
 
+# EntityNode 的全文检索。
+# 搜索对象是节点的 name 和 summary。
 async def node_fulltext_search(
     driver: GraphDriver,
     query: str,
@@ -610,6 +674,7 @@ async def node_fulltext_search(
         yield_query = 'WITH node AS n, score'
 
     if driver.provider == GraphProvider.NEPTUNE:
+        # Neptune 通过 AOSS 查询节点全文索引，再回查图节点。
         res = driver.run_aoss_query('node_name_and_summary', query, limit=limit)  # pyright: ignore reportAttributeAccessIssue
         if res['hits']['total']['value'] > 0:
             input_ids = []
@@ -669,6 +734,8 @@ async def node_fulltext_search(
     return nodes
 
 
+# EntityNode 的向量相似度检索。
+# 搜索对象是 n.name_embedding，所以更偏“实体名称相似”，常用于节点去重候选召回。
 async def node_similarity_search(
     driver: GraphDriver,
     search_vector: list[float],
@@ -699,6 +766,7 @@ async def node_similarity_search(
         search_vector_var = f'CAST($search_vector AS FLOAT[{len(search_vector)}])'
 
     if driver.provider == GraphProvider.NEPTUNE:
+        # Neptune 分支把 embedding 取出来后由 Python 计算相似度。
         query = (
             """
                                                                                                                                     MATCH (n:Entity)
@@ -787,6 +855,8 @@ async def node_similarity_search(
     return nodes
 
 
+# 基于图结构的 node BFS 搜索。
+# 和 node_similarity_search 不同，它找的是图上离起点近的实体节点。
 async def node_bfs_search(
     driver: GraphDriver,
     bfs_origin_node_uuids: list[str] | None,
@@ -819,6 +889,7 @@ async def node_bfs_search(
     if filter_queries:
         filter_query = ' AND ' + (' AND '.join(filter_queries))
 
+    # 默认路径：从起点沿 RELATES_TO / MENTIONS 走到 Entity。
     match_queries = [
         f"""
         UNWIND $bfs_origin_node_uuids AS origin_uuid
@@ -838,6 +909,8 @@ async def node_bfs_search(
         ]
 
     if driver.provider == GraphProvider.KUZU:
+        # Kuzu 的关系中间节点导致 BFS 深度需要扩大。
+        # 对 Episodic 起点和 Entity 起点分别写不同匹配语句。
         depth = bfs_max_depth * 2
         match_queries = [
             """
@@ -883,6 +956,8 @@ async def node_bfs_search(
     return nodes
 
 
+# Episode 的全文检索。
+# 搜索对象是 episode.content，也就是原始输入文本。
 async def episode_fulltext_search(
     driver: GraphDriver,
     query: str,
@@ -969,6 +1044,8 @@ async def episode_fulltext_search(
     return episodes
 
 
+# Community 的全文检索。
+# 搜索对象是 community.name，适合找主题簇/社区摘要入口。
 async def community_fulltext_search(
     driver: GraphDriver,
     query: str,
@@ -1058,6 +1135,8 @@ async def community_fulltext_search(
     return communities
 
 
+# Community 的向量相似度检索。
+# 搜索对象是 c.name_embedding。
 async def community_similarity_search(
     driver: GraphDriver,
     search_vector: list[float],
@@ -1176,6 +1255,8 @@ async def community_similarity_search(
     return communities
 
 
+# 节点 hybrid search。
+# 它把多个全文查询结果和多个向量查询结果合并，然后用 RRF 排序。
 async def hybrid_node_search(
     queries: list[str],
     embeddings: list[list[float]],
@@ -1223,6 +1304,9 @@ async def hybrid_node_search(
     """
 
     start = time()
+
+    # 并发执行所有全文检索和向量检索。
+    # 每个单路搜索取 2 * limit，给融合排序留出余量。
     results: list[list[EntityNode]] = list(
         await semaphore_gather(
             *[
@@ -1236,11 +1320,13 @@ async def hybrid_node_search(
         )
     )
 
+    # 先按 uuid 去重，保留 uuid -> node 对象映射。
     node_uuid_map: dict[str, EntityNode] = {
         node.uuid: node for result in results for node in result
     }
     result_uuids = [[node.uuid for node in result] for result in results]
 
+    # RRF 只需要每一路搜索的 uuid 排名列表。
     ranked_uuids, _ = rrf(result_uuids)
 
     relevant_nodes: list[EntityNode] = [node_uuid_map[uuid] for uuid in ranked_uuids]
@@ -1250,6 +1336,8 @@ async def hybrid_node_search(
     return relevant_nodes
 
 
+# 给一批输入节点分别找相关已有节点。
+# 这类函数常用于去重前的候选召回：每个新节点都要找到一组可能重复的旧节点。
 async def get_relevant_nodes(
     driver: GraphDriver,
     nodes: list[EntityNode],
@@ -1260,6 +1348,7 @@ async def get_relevant_nodes(
     if len(nodes) == 0:
         return []
 
+    # 假设这一批节点属于同一个 group_id。
     group_id = nodes[0].group_id
     query_nodes = [
         {
@@ -1332,6 +1421,10 @@ async def get_relevant_nodes(
             """
         )
     else:
+        # 默认后端在单个 query 中对每个输入 node 同时做：
+        # 1. name_embedding 向量相似搜索；
+        # 2. name/summary 全文搜索；
+        # 3. 合并并去重结果。
         query = (
             """
                                                                                                                                     UNWIND $nodes AS node
@@ -1392,6 +1485,8 @@ async def get_relevant_nodes(
         **filter_params,
     )
 
+    # 返回形状必须和输入 nodes 对齐：
+    # 第 i 个输入节点对应第 i 个候选列表。
     relevant_nodes_dict: dict[str, list[EntityNode]] = {
         result['search_node_uuid']: [
             get_entity_node_from_record(record, driver.provider) for record in result['matches']
@@ -1404,6 +1499,8 @@ async def get_relevant_nodes(
     return relevant_nodes
 
 
+# 给一批输入边分别找相关已有边。
+# 这通常用于 edge 去重：同端点、fact_embedding 相似的已有边可能就是重复事实。
 async def get_relevant_edges(
     driver: GraphDriver,
     edges: list[EntityEdge],
@@ -1533,6 +1630,7 @@ async def get_relevant_edges(
                 """
             )
         else:
+            # 默认后端：对每个输入 edge，只在相同 source/target 之间找 fact_embedding 相似的边。
             query = (
                 """
                                                                                                                                         UNWIND $edges AS edge
@@ -1589,6 +1687,9 @@ async def get_relevant_edges(
     return relevant_edges
 
 
+# 给一批输入边寻找可能被其 invalidated 的候选边。
+# 和 get_relevant_edges 不同，这里不限制端点完全相同，而是找与 source/target 任一端相关的边。
+# 这更适合发现“新事实可能推翻的旧事实”。
 async def get_edge_invalidation_candidates(
     driver: GraphDriver,
     edges: list[EntityEdge],
@@ -1764,6 +1865,7 @@ async def get_edge_invalidation_candidates(
             routing_='r',
             **filter_params,
         )
+
     invalidation_edges_dict: dict[str, list[EntityEdge]] = {
         result['search_edge_uuid']: [
             get_entity_edge_from_record(record, driver.provider) for record in result['matches']
@@ -1777,6 +1879,9 @@ async def get_edge_invalidation_candidates(
 
 
 # takes in a list of rankings of uuids
+# Reciprocal Rank Fusion。
+# 输入是多路搜索结果的 uuid 排名列表，输出是融合后的 uuid 排名。
+# 一个 uuid 在多个检索器里都靠前，就会获得更高分。
 def rrf(
     results: list[list[str]], rank_const=1, min_score: float = 0
 ) -> tuple[list[str], list[float]]:
@@ -1795,6 +1900,8 @@ def rrf(
     ]
 
 
+# 按图距离重新排序节点。
+# 目标是：当用户给了 center_node_uuid 时，优先返回离这个中心节点更近的节点。
 async def node_distance_reranker(
     driver: GraphDriver,
     node_uuids: list[str],
@@ -1810,9 +1917,12 @@ async def node_distance_reranker(
             pass
 
     # filter out node_uuid center node node uuid
+    # 中心节点单独处理，避免自己和自己算路径。
     filtered_uuids = list(filter(lambda node_uuid: node_uuid != center_node_uuid, node_uuids))
     scores: dict[str, float] = {center_node_uuid: 0.0}
 
+    # 当前实现只查直接相邻关系，返回 score=1。
+    # 没查到的节点后面会被设成 inf，排序时靠后。
     query = """
     UNWIND $node_uuids AS node_uuid
     MATCH (center:Entity {uuid: $center_uuid})-[:RELATES_TO]-(n:Entity {uuid: node_uuid})
@@ -1840,6 +1950,7 @@ async def node_distance_reranker(
         score = result['score']
         scores[uuid] = score
 
+    # 不可达节点设成 inf，最后 1 / inf = 0，天然排在后面。
     for uuid in filtered_uuids:
         if uuid not in scores:
             scores[uuid] = float('inf')
@@ -1848,6 +1959,7 @@ async def node_distance_reranker(
     filtered_uuids.sort(key=lambda cur_uuid: scores[cur_uuid])
 
     # add back in filtered center uuid if it was filtered out
+    # 如果原始结果里包含中心节点，就把它放回第一位，并给一个非零分数，避免 1/0。
     if center_node_uuid in node_uuids:
         scores[center_node_uuid] = 0.1
         filtered_uuids = [center_node_uuid] + filtered_uuids
@@ -1857,6 +1969,8 @@ async def node_distance_reranker(
     ]
 
 
+# 按 episode mentions 次数重新排序节点。
+# 它先用 RRF 合并多个节点列表，再统计每个节点被多少 episode 提到。
 async def episode_mentions_reranker(
     driver: GraphDriver, node_uuids: list[list[str]], min_score: float = 0
 ) -> tuple[list[str], list[float]]:
@@ -1873,6 +1987,7 @@ async def episode_mentions_reranker(
     scores: dict[str, float] = {}
 
     # Find the shortest path to center node
+    # 这里实际统计的是 MENTIONS 出现次数，而不是路径距离。
     results, _, _ = await driver.execute_query(
         """
         UNWIND $node_uuids AS node_uuid
@@ -1891,6 +2006,7 @@ async def episode_mentions_reranker(
             scores[uuid] = float('inf')
 
     # rerank on shortest distance
+    # 这里按 score 升序排序；保留原逻辑，不在注释中假设它一定代表“越多越靠前”。
     sorted_uuids.sort(key=lambda cur_uuid: scores[cur_uuid])
 
     return [uuid for uuid in sorted_uuids if scores[uuid] >= min_score], [
@@ -1898,6 +2014,8 @@ async def episode_mentions_reranker(
     ]
 
 
+# Maximal Marginal Relevance。
+# 它在“和 query 相关”与“结果之间不要太相似”之间做平衡，用于提升多样性。
 def maximal_marginal_relevance(
     query_vector: list[float],
     candidates: dict[str, list[float]],
@@ -1906,12 +2024,16 @@ def maximal_marginal_relevance(
 ) -> tuple[list[str], list[float]]:
     start = time()
     query_array = np.array(query_vector)
+
+    # 先把所有候选向量归一化，便于后面点积近似 cosine。
     candidate_arrays: dict[str, NDArray] = {}
     for uuid, embedding in candidates.items():
         candidate_arrays[uuid] = normalize_l2(embedding)
 
     uuids: list[str] = list(candidate_arrays.keys())
 
+    # 计算候选之间的相似度矩阵。
+    # MMR 需要知道每个候选和其他候选有多像，以便惩罚冗余结果。
     similarity_matrix = np.zeros((len(uuids), len(uuids)))
 
     for i, uuid_1 in enumerate(uuids):
@@ -1923,6 +2045,8 @@ def maximal_marginal_relevance(
             similarity_matrix[i, j] = similarity
             similarity_matrix[j, i] = similarity
 
+    # 当前实现用每个候选与其他候选的最大相似度作为冗余惩罚项。
+    # mmr_lambda 越大，越偏向 query 相关性；越小，越强调结果多样性。
     mmr_scores: dict[str, float] = {}
     for i, uuid in enumerate(uuids):
         max_sim = np.max(similarity_matrix[i, :])
@@ -1939,6 +2063,8 @@ def maximal_marginal_relevance(
     ]
 
 
+# 批量加载 EntityNode 的 name_embedding。
+# 这通常服务于后续向量 rerank 或候选相似度计算。
 async def get_embeddings_for_nodes(
     driver: GraphDriver, nodes: list[EntityNode]
 ) -> dict[str, list[float]]:
@@ -1960,6 +2086,7 @@ async def get_embeddings_for_nodes(
             n.uuid AS uuid,
             n.name_embedding AS name_embedding
         """
+
     results, _, _ = await driver.execute_query(
         query,
         node_uuids=[node.uuid for node in nodes],
@@ -1976,6 +2103,7 @@ async def get_embeddings_for_nodes(
     return embeddings_dict
 
 
+# 批量加载 CommunityNode 的 name_embedding。
 async def get_embeddings_for_communities(
     driver: GraphDriver, communities: list[CommunityNode]
 ) -> dict[str, list[float]]:
@@ -2001,6 +2129,7 @@ async def get_embeddings_for_communities(
             c.uuid AS uuid,
             c.name_embedding AS name_embedding
         """
+
     results, _, _ = await driver.execute_query(
         query,
         community_uuids=[community.uuid for community in communities],
@@ -2017,6 +2146,8 @@ async def get_embeddings_for_communities(
     return embeddings_dict
 
 
+# 批量加载 EntityEdge 的 fact_embedding。
+# edge 的 embedding 绑定的是 fact，而不是关系 name。
 async def get_embeddings_for_edges(
     driver: GraphDriver, edges: list[EntityEdge]
 ) -> dict[str, list[float]]:
@@ -2048,6 +2179,7 @@ async def get_embeddings_for_edges(
             e.fact_embedding AS fact_embedding
         """
         )
+
     results, _, _ = await driver.execute_query(
         query,
         edge_uuids=[edge.uuid for edge in edges],
